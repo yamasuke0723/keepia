@@ -1,0 +1,661 @@
+Keepia V2 利用者・認証関連SQL 詳細説明
+========================================
+
+対象SQL
+-------
+V2__create_user_auth_tables.sql
+
+参照資料
+--------
+・keepia_要件定義書.xlsx
+・keepia_テーブル設計書.xlsx
+
+
+1. このSQLの目的
+----------------
+
+このSQLは、データを検索するSELECT文ではなく、Keepiaの利用者・認証基盤を作るDDLです。
+Spring Boot起動時にFlywayがV2として一度だけ実行し、以下の4テーブルを作成します。
+
+・app_users：Keepiaを利用するアカウント
+・user_tokens：招待・パスワード再設定用の一回限りトークン
+・auth_mail_jobs：招待・再設定メールの送信予約
+・login_rate_limits：ログイン失敗回数と一時的なログイン制限
+
+既にV1で作成したtenantsテーブルと組み合わせることで、保守会社と利用者の所属関係を管理します。
+
+テーブル関係は次のとおりです。
+
+tenants
+  └─ app_users
+       ├─ user_tokens
+       └─ auth_mail_jobs
+             └─ user_tokensも参照
+
+login_rate_limitsは、メールアドレスやIPアドレスを基にした認証制限を独立して管理します。
+
+
+2. SQLで使用している基本構文
+----------------------------
+
+2.1 CREATE TABLE
+
+例：
+
+CREATE TABLE app_users (
+    ...
+);
+
+新しいテーブルを作成します。同名テーブルが既に存在する場合はエラーになります。
+FlywayはV2を一度だけ実行するため、通常の起動で同じCREATE TABLEが繰り返されることはありません。
+
+
+2.2 PRIMARY KEY
+
+例：
+
+id UUID PRIMARY KEY
+
+テーブルの1行を一意に識別する主キーです。
+UUIDは「550e8400-e29b-41d4-a716-446655440000」のような識別子です。
+
+テーブル設計書では、UUIDをDBで自動採番せず、Java側で生成する方針です。
+そのため、IDカラムにはDEFAULTを設定していません。
+
+
+2.3 NOT NULL
+
+例：
+
+email VARCHAR(254) NOT NULL
+
+値が必須であることを表します。NULL、つまり「値がない状態」は保存できません。
+
+
+2.4 DEFAULT
+
+例：
+
+status VARCHAR(16) NOT NULL DEFAULT 'INVITED'
+
+INSERT時に値を指定しなかった場合、INVITEDが自動設定されます。
+
+
+2.5 FOREIGN KEY
+
+例：
+
+FOREIGN KEY (tenant_id)
+REFERENCES tenants (id)
+
+app_users.tenant_idには、tenantsテーブルに存在するIDしか登録できません。
+
+
+2.6 ON DELETE RESTRICT
+
+参照されている親データの物理削除を禁止します。
+
+利用者が所属している保守会社を削除すると関係が壊れるため、tenantsの物理削除を拒否します。
+Keepiaでは通常の画面操作で削除せず、statusをSTOPPEDへ変更する方針です。
+
+
+2.7 UNIQUE
+
+例：
+
+UNIQUE (email)
+
+同じ値を複数行へ登録できなくします。
+app_users.emailは、保守会社が異なる場合も含めてシステム全体で一意です。
+
+
+2.8 CHECK
+
+例：
+
+CHECK (version >= 0)
+
+保存値が条件を満たすかPostgreSQL側で検査します。
+Java側の入力チェックを通らない処理があっても、DBが不正な値を拒否します。
+
+
+2.9 CREATE INDEX
+
+例：
+
+CREATE INDEX idx_app_users_tenant_status
+    ON app_users (tenant_id, status);
+
+検索を速くするための索引です。テーブルのデータが増えたときに効果があります。
+
+
+3. app_usersテーブル
+--------------------
+
+3.1 目的
+
+Keepiaへログインするすべての利用者を保存します。
+
+対応する主な要件は以下です。
+
+・FR01：ログイン
+・FR03：利用者管理
+・FR04：パスワード再設定
+・FR29：権限変更の反映
+・BR02：所属と役割
+・NFR01：情報分離と認可
+・NFR02：認証と秘密
+・NFR03：セッション失効
+
+
+3.2 識別IDと所属
+
+id
+  利用者自身のUUIDです。Java側で生成します。
+
+tenant_id
+  利用者が所属する保守会社のIDです。
+  ADMIN、STAFF、CUSTOMERでは必須です。
+  サービス運営者OPERATORではNULLです。
+
+customer_id
+  顧客窓口が所属する顧客企業のIDです。
+  CUSTOMERだけ必須です。
+  OPERATOR、ADMIN、STAFFではNULLです。
+
+
+3.3 メールアドレスと氏名
+
+email
+  ログインIDとして使うメールアドレスです。
+  最大254文字で、システム全体で一意です。
+
+display_name
+  画面上に表示する利用者名です。最大100文字です。
+
+メールアドレスには次のCHECK制約があります。
+
+・すべて小文字であること
+・前後に空白がないこと
+・空文字でないこと
+
+Java側でも保存前にtrimと小文字変換を行います。
+
+
+3.4 役割
+
+roleには次の4種類だけを保存できます。
+
+OPERATOR
+  Keepiaサービス運営者です。保守会社や顧客企業には所属しません。
+
+ADMIN
+  保守会社管理者です。利用者、顧客、契約、月次報告などを管理します。
+
+STAFF
+  保守担当者です。問い合わせ対応や作業記録を行います。
+
+CUSTOMER
+  顧客窓口です。自社の問い合わせや公開済み月次報告を利用します。
+
+
+3.5 利用状態
+
+statusには次の3種類があります。
+
+INVITED
+  招待済みですが、パスワード設定が完了していません。
+
+ACTIVE
+  ログイン可能な状態です。
+
+STOPPED
+  利用停止状態です。ログインや保護された操作を拒否します。
+
+初期値はINVITEDです。
+
+
+3.6 役割と所属の整合性
+
+chk_app_users_assignmentは、役割と所属の組み合わせをDBで検査します。
+
+OPERATOR
+  tenant_id：NULL
+  customer_id：NULL
+
+ADMIN、STAFF
+  tenant_id：必須
+  customer_id：NULL
+
+CUSTOMER
+  tenant_id：必須
+  customer_id：必須
+
+これにより、保守会社に所属していないSTAFFや、顧客企業が設定されていないCUSTOMERなどを登録できません。
+
+
+3.7 パスワード
+
+password_hashには、パスワードそのものではなく、Spring SecurityのPasswordEncoderで生成したハッシュを保存します。
+
+招待中はパスワードが未設定なのでNULLを許可します。
+statusがACTIVEの場合は、password_hashが必須です。
+
+パスワードの15文字以上、128文字以下という条件はJava側で検証します。
+ハッシュ化後は元の文字数が分からないため、DBのpassword_hashでは検査できません。
+
+
+3.8 security_version
+
+security_versionは、既存のログインセッションを無効化するための認証世代です。
+
+例：
+
+ログイン時
+  DBのsecurity_version：0
+  セッションのsecurity_version：0
+
+パスワード再設定または役割変更後
+  DBのsecurity_version：1
+  古いセッションのsecurity_version：0
+
+値が一致しないため、古いセッションからの次のリクエストを拒否できます。
+
+Java側では、以下の操作時にsecurity_versionを増加させます。
+
+・パスワード再設定
+・役割変更
+・所属変更
+・利用停止
+
+
+3.9 作成日時・更新日時・楽観ロック
+
+created_at
+  利用者を作成した日時です。
+
+updated_at
+  最後に変更した日時です。
+  DEFAULTはINSERT時だけなので、更新時はJava側で設定します。
+
+version
+  同時更新を検出する番号です。
+  JavaのEntityでは@Versionを付けます。
+
+複数の管理者が同じ利用者を同時に変更した場合、後から保存した側を競合エラーにできます。
+
+
+3.10 複合一意制約
+
+UNIQUE (tenant_id, id)
+UNIQUE (tenant_id, customer_id, id)
+
+idは主キーなので、単純な一意性だけを見ると重複しているように見えます。
+これらは、後続のテーブルから複合外部キーで参照するために用意しています。
+
+例えば問い合わせの連絡先について、利用者IDだけでなく、保守会社IDと顧客IDもまとめて参照します。
+これにより、別の保守会社や別の顧客企業の利用者を誤って指定することを防ぎます。
+
+
+3.11 インデックス
+
+idx_app_users_tenant_status
+  保守会社ごとに利用中・停止中の利用者を検索します。
+
+idx_app_users_tenant_role
+  保守会社内の管理者・担当者を検索します。
+
+idx_app_users_tenant_customer
+  顧客企業に所属する窓口担当者を検索します。
+
+
+4. user_tokensテーブル
+----------------------
+
+4.1 目的
+
+利用者の招待リンクとパスワード再設定リンクを管理します。
+
+対応する主な要件は以下です。
+
+・FR03：利用者招待
+・FR04：パスワード設定・再設定
+・NFR02：認証情報と秘密の保護
+・PV15：リンク期限30分
+・AC01：期限切れと再使用の拒否
+
+
+4.2 利用者との関連
+
+user_idはapp_users.idを参照します。
+実在しない利用者にトークンを発行することはできません。
+
+ON DELETE RESTRICTにより、トークンが存在する利用者の物理削除も禁止します。
+
+
+4.3 token_hash
+
+メールURLに入れる平文トークンはDBへ保存しません。
+
+処理の流れは次のとおりです。
+
+1. JavaのSecureRandomで十分に長いランダム値を生成
+2. 平文トークンを招待・再設定URLへ設定
+3. 平文トークンをSHA-256でハッシュ化
+4. 64文字の16進数をtoken_hashへ保存
+
+CHECK制約により、token_hashは小文字の16進数64文字だけを許可します。
+UNIQUE制約により、同じハッシュの重複も禁止します。
+
+
+4.4 purpose
+
+トークンの用途です。
+
+INVITE
+  新規利用者の招待用です。
+
+RESET
+  既存利用者のパスワード再設定用です。
+
+招待用トークンをパスワード再設定処理で使うなど、用途が異なる操作はJava側で拒否します。
+
+
+4.5 有効期限と一回限りの利用
+
+created_at
+  発行日時です。
+
+expires_at
+  有効期限です。Java側で発行日時から30分後を設定します。
+
+used_at
+  トークンを使用した日時です。未使用の場合はNULLです。
+
+CHECK制約によって、expires_atがcreated_atより後であることと、used_atがcreated_atより前にならないことを保証します。
+
+一回限りの利用は、Java側で次の処理を同じトランザクション内に実施します。
+
+1. 対象トークン行をロック
+2. used_atがNULLであることを確認
+3. expires_atが現在時刻より後であることを確認
+4. purposeが処理内容と一致することを確認
+5. パスワードを更新
+6. used_atを現在時刻に更新
+7. app_users.security_versionを増加
+8. コミット
+
+
+4.6 部分インデックス
+
+idx_user_tokens_user_purposeは、used_at IS NULLの未使用トークンだけを索引へ登録します。
+
+使用済みトークンが増えても、現在有効な招待・再設定トークンを高速に検索できます。
+
+
+5. auth_mail_jobsテーブル
+-------------------------
+
+5.1 目的
+
+招待メールとパスワード再設定メールを非同期で送るための予約テーブルです。
+
+画面処理の中で直接メールを送らず、以下の順番で保存します。
+
+1. app_usersへ利用者を保存
+2. user_tokensへトークンハッシュを保存
+3. auth_mail_jobsへメール送信予約を保存
+4. DBトランザクションをコミット
+5. バックグラウンド処理がメールを送信
+
+この構成により、メールサーバーが遅い場合でも画面処理を長時間待たせずに済みます。
+
+
+5.2 user_idとtoken_id
+
+user_idは送信対象の利用者です。
+token_idはメール内で利用するトークンです。
+
+FOREIGN KEY (user_id, token_id)
+REFERENCES user_tokens (user_id, id)
+
+という複合外部キーにより、指定されたトークンが同じ利用者のものであることを保証します。
+
+利用者Aへ利用者Bのトークンを送るような誤登録はDBが拒否します。
+
+
+5.3 encrypted_payload
+
+メール送信時には平文トークンを含むURLが必要です。
+その平文URLをそのままDBへ保存すると、user_tokensでハッシュ化した意味がなくなります。
+
+そこで、メール送信用URLを暗号化し、BYTEA形式でencrypted_payloadへ保存します。
+暗号鍵はDBやGitへ保存せず、環境変数や秘密管理サービスで管理します。
+
+CHECK制約では空の暗号化データを拒否します。
+
+
+5.4 status
+
+PENDING
+  送信待ちです。
+
+SENDING
+  送信処理中です。
+
+SENT
+  メールサービスが受付に成功しました。
+
+FAILED
+  明確に送信が失敗しました。
+
+UNKNOWN
+  タイムアウトなどにより、送れたか確認できない状態です。
+  二重送信を避けるため自動再送しません。
+
+CANCELLED
+  宛先停止や期限切れなどにより送信を取り消した状態です。
+
+
+5.5 再試行
+
+attempt_count
+  送信を試した回数です。
+
+next_attempt_at
+  次に送信を試す日時です。
+
+expires_at
+  メール送信予約の期限です。
+
+要件案では、最初の送信失敗後、5分間隔で最大3回再試行します。
+具体的な5分・3回という判定はJava側で実装します。
+
+CHECK (next_attempt_at <= expires_at)により、期限より後の再試行予定は登録できません。
+
+
+5.6 送信待ちインデックス
+
+idx_auth_mail_jobs_pendingは、PENDING状態だけを対象に、next_attempt_atとidを索引化します。
+
+バックグラウンド処理では概ね次の条件で検索します。
+
+status = 'PENDING'
+かつ next_attempt_at <= 現在時刻
+
+その検索を高速化するためのインデックスです。
+
+
+6. login_rate_limitsテーブル
+-----------------------------
+
+6.1 目的
+
+パスワードを連続して間違えた場合のログイン制限を永続化します。
+
+要件案は次のとおりです。
+
+・連続5回失敗
+・15分間ログインを制限
+・アカウントと接続元IPの両方を制限
+
+
+6.2 key_hash
+
+メールアドレスやIPアドレスをそのまま保存せず、用途を含めてHMAC化します。
+
+例：
+
+ACCOUNT:user@example.com
+IP:192.0.2.10
+
+これらを秘密鍵付きHMACで変換し、64文字のハッシュだけを保存します。
+
+UNIQUE制約によって、同じアカウントまたはIPに対する制限行を1つにまとめます。
+
+
+6.3 failure_countとwindow_started_at
+
+failure_count
+  現在の計数期間内でパスワードを間違えた回数です。
+
+window_started_at
+  失敗回数を数え始めた日時です。
+
+CHECK制約により、失敗回数が負になることを防ぎます。
+
+
+6.4 blocked_until
+
+ログイン制限の終了日時です。制限されていない場合はNULLです。
+
+5回失敗したとき、Java側で現在時刻から15分後を設定します。
+
+CHECK制約により、blocked_untilがwindow_started_atより前になることを防ぎます。
+
+
+6.5 version
+
+同じアカウントへ複数のログイン試行が同時に来た場合、失敗回数の更新が失われることを防ぎます。
+
+JavaのEntityでは@Versionを指定します。競合した場合は、最新状態を取得して再判定します。
+
+
+7. 要件とSQL・Javaの分担
+------------------------
+
+FR01 ログイン
+  SQL：app_users、login_rate_limits、役割・状態制約
+  Java：パスワード照合、停止確認、5回失敗と15分制限
+
+FR03 利用者管理
+  SQL：app_users、user_tokens、auth_mail_jobs
+  Java：利用者招待、最後の管理者保護、メール送信予約
+
+FR04 パスワード再設定
+  SQL：トークン用途、期限、使用日時
+  Java：30分期限、一回利用、パスワード更新、旧セッション失効
+
+FR29 権限変更の反映
+  SQL：security_version、役割と所属のCHECK制約
+  Java：変更時の世代増加、リクエストごとの再認可
+
+NFR01 情報分離と認可
+  SQL：tenant_idと複合一意制約
+  Java：ログイン利用者からテナントを決定し、画面入力のtenant_idを信用しない
+
+NFR02 認証と秘密
+  SQL：password_hash、token_hash、key_hash、encrypted_payload
+  Java：PasswordEncoder、SecureRandom、SHA-256、HMAC、暗号鍵管理
+
+NFR03 セッション失効
+  SQL：security_version、status
+  Java：セッション保存値と現在のDB値を比較
+
+
+8. SQLだけでは保証できない処理
+----------------------------
+
+以下はJava側で実装する必要があります。
+
+・パスワードが15～128文字か検証する
+・PasswordEncoderでパスワードをハッシュ化する
+・安全なランダムトークンを生成する
+・トークン期限を発行から30分後に設定する
+・トークン行をロックして一回限りの利用を保証する
+・役割変更やパスワード再設定でsecurity_versionを増加する
+・最後の有効なADMINを停止できないようにする
+・ログイン失敗5回と15分制限を判定する
+・メールを5分間隔、最大3回再試行する
+・UNKNOWN状態を自動再送しない
+・updated_atを更新時に設定する
+・すべての操作で現在のtenant_id、customer_id、role、statusを再確認する
+
+
+9. テーブル設計・要件との照合結果
+----------------------------------
+
+9.1 整合している点
+
+・4テーブルのカラム名、型、必須条件、初期値はテーブル設計書と一致している
+・app_usersの役割と所属条件はBR02およびDB02と一致している
+・メールアドレスの全体一意性をUNIQUE制約で保証している
+・パスワードを平文保存しない構成になっている
+・招待・再設定トークンをハッシュ保存する構成になっている
+・トークンの期限と使用日時を保存できる
+・security_versionにより既存セッションの失効を実装できる
+・ログイン失敗5回、15分制限を実装できるカラムが用意されている
+・認証メールを画面処理と分離して送信できる
+・送信失敗、結果不明、取消を区別できる
+・各テーブルの検索方法に対応するインデックスが用意されている
+
+
+9.2 customer_idの外部キー
+
+app_users.customer_idは、テーブル設計書上はcustomersを参照します。
+現時点ではcustomersテーブルが存在しないため、V2では外部キーを設定していません。
+
+customersを作成する後続マイグレーションで、以下の複合外部キーを追加します。
+
+FOREIGN KEY (tenant_id, customer_id)
+REFERENCES customers (tenant_id, id)
+
+これにより、顧客窓口が同じ保守会社内の顧客企業に所属することをDBでも保証します。
+
+
+9.3 encrypted_payloadの消去条件
+
+テーブル設計書では、暗号化リンクを送信成功または期限切れで消去する方針です。
+
+一方、現在のV2では以下の条件になっています。
+
+・encrypted_payloadはNOT NULL
+・暗号化データは空にできない
+
+このままではSENTまたはCANCELLEDになった後にNULLへ消去できません。
+
+V2はすでに適用済みなので、V2を変更せず、後続のFlywayマイグレーションで修正します。
+
+推奨ファイル名：
+
+V3__fix_auth_mail_payload_lifecycle.sql
+
+修正後は、PENDING、SENDING、FAILED、UNKNOWNでは暗号化データを必須とし、SENT、CANCELLEDではNULLへ消去できるようにします。
+
+
+10. 今後の実装順序
+------------------
+
+1. V2の実行結果と4テーブルを確認
+2. V2をGitへコミット
+3. auth_mail_jobsの暗号化データ消去条件をV3で調整
+4. customersと顧客・契約関連テーブルを後続マイグレーションで作成
+5. app_usersからcustomersへの複合外部キーを追加
+6. Tenant、AppUser、UserToken、AuthMailJob、LoginRateLimitのEntityを作成
+7. 各Repositoryを作成
+8. AccountServiceで招待・再設定・利用者管理を実装
+9. Spring Securityでログインとセッション失効を実装
+10. 認証・権限・テナント境界を確認
+
+
+以上
