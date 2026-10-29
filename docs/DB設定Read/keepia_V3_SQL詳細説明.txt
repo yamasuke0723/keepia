@@ -1,0 +1,520 @@
+Keepia V3 顧客・契約・営業時間関連SQL 詳細説明
+==========================================
+
+対象SQL
+-------
+V3__create_customer_contract_table.sql
+
+説明の基準
+----------
+現在のV3 SQLと、既存の「keepia_V2_SQL詳細説明.txt」を確認して作成しました。
+この文書は、V3に実際に記述されている制約と処理を説明します。
+要件定義書・テーブル設計書との完全な照合結果ではありません。
+
+
+1. このSQLの目的
+----------------
+
+V3は、検索用のSELECT文ではなく、Keepiaのデータ構造を追加・変更するFlywayマイグレーションです。
+V1で作成したtenants、V2で作成したapp_usersとauth_mail_jobsを利用します。
+
+V3で行う主な処理は次のとおりです。
+
+・認証メール予約の暗号化データを、送信完了後や取消後に消去できるようにする
+・顧客企業と対象サービスを登録するテーブルを作る
+・営業時間・休業日の版と、その内容を保存するテーブルを作る
+・契約と契約条件の版を保存するテーブルを作る
+・同一テナント内の参照、期間の重複禁止、版データの変更禁止をDBで検査する
+
+V3で新規作成するテーブルは次の7つです。
+
+customers         顧客企業
+services          対象サービス
+calendar_versions 営業時間・休業日の版
+business_hours    版ごとの曜日別営業時間
+holidays          版ごとの休業日
+contracts         顧客企業と対象サービスの契約
+contract_versions 契約条件の版
+
+関係の概略は次のとおりです。
+
+tenants
+  ├─ customers ───────┬─ app_users.customer_id
+  │                   └─ contracts
+  ├─ services ─────────── contracts
+  └─ calendar_versions ──┬─ business_hours
+                         └─ contract_versions
+
+contracts と contract_versions は、契約本体と現在版が相互に参照します。
+holidaysにはcalendar_version_idがありますが、現行V3ではcalendar_versionsへの
+外部キーが設定されていません。この点は後述します。
+
+
+2. V3で使用している主なSQL構文
+------------------------------
+
+2.1 ALTER TABLE、DROP CONSTRAINT、ADD CONSTRAINT
+
+例：
+
+ALTER TABLE auth_mail_jobs
+    DROP CONSTRAINT chk_auth_mail_jobs_payload;
+
+既存テーブルの定義を変更します。
+V2で設定した「暗号化データは常に空でない」という制約を外し、
+V3で状態に応じた新しい制約を追加します。
+
+2.2 UPDATE
+
+例：
+
+UPDATE auth_mail_jobs
+SET encrypted_payload = NULL,
+    updated_at = CURRENT_TIMESTAMP,
+    version = version + 1
+WHERE status IN ('SENT', 'CANCELLED');
+
+条件に合う既存行を更新します。
+このUPDATEはV3適用時に一度実行されます。以後の状態変更を自動処理するものではありません。
+
+2.3 CREATE EXTENSION IF NOT EXISTS btree_gist
+
+btree_gistは、GiST索引でUUIDやSMALLINTなどの等価比較を使うための拡張です。
+V3のEXCLUDE制約は、テナントIDなどの等価比較と期間の重複判定を組み合わせます。
+IF NOT EXISTSにより、既に拡張がある場合は作成を繰り返しません。
+
+2.4 複合FOREIGN KEYと複合UNIQUE
+
+例：
+
+FOREIGN KEY (tenant_id, customer_id)
+REFERENCES customers (tenant_id, id)
+
+顧客IDだけでなくテナントIDも合わせて照合します。
+これにより、別の保守会社に属する顧客を誤って参照することを防ぎます。
+参照先のUNIQUE (tenant_id, id)は、この複合外部キーを成立させるためにも使います。
+
+2.5 CHECK
+
+例：
+
+CHECK (ends_on IS NULL OR ends_on >= starts_on)
+
+登録・更新する行が指定条件を満たすか、PostgreSQLが検査します。
+例の条件は「終了日がない」または「終了日が開始日以降」を意味します。
+
+2.6 EXCLUDE USING gist
+
+例：
+
+EXCLUDE USING gist (
+    tenant_id WITH =,
+    customer_id WITH =,
+    service_id WITH =,
+    daterange(starts_on, ends_on, '[]') WITH &&
+)
+WHERE (status = 'ACTIVE')
+
+同じテナント・顧客・サービスについて、ACTIVE契約の期間が重なる登録を拒否します。
+「WITH =」は値が同じこと、「WITH &&」は期間が重なることを表します。
+WHEREにより、重複禁止の対象はACTIVE契約だけです。
+
+2.7 DEFERRABLE INITIALLY DEFERRED
+
+行の登録時の外部キー参照確認を、トランザクション終了時まで延期できます。
+V3ではcontractsとcontract_versionsが相互に参照するため、
+両方の行を同じトランザクションで登録できるように指定しています。
+片方だけを登録してコミットすることはできません。
+ON DELETE RESTRICTによる参照先の削除拒否は延期されません。
+
+2.8 CREATE FUNCTION、CREATE TRIGGER
+
+版管理テーブルに対するUPDATE、DELETE、TRUNCATEを拒否するために使います。
+トリガーは指定された操作の直前に関数を呼び出します。
+関数は例外を発生させ、その操作を中止します。
+
+2.9 CREATE INDEX
+
+検索条件に使う列の索引を追加します。
+索引は検索を助けますが、必要なデータだけを返す権限制御は行いません。
+
+2.10 ON DELETE RESTRICT
+
+参照されている親行の物理削除を拒否します。
+たとえば契約が参照する顧客やサービスを削除すると、
+契約の参照先が失われるためDBが削除を拒否します。
+statusをSTOPPEDへ変更する処理は、物理削除とは別です。
+
+2.11 DATE、TIME、TIMESTAMPTZ
+
+DATEは日付、TIME WITHOUT TIME ZONEは日付と時間帯を持たない時刻、
+TIMESTAMPTZは時間帯を考慮して保存する日時です。
+business_hoursの開始・終了時刻はTIMEであり、
+calendar_versions.zone_idを用いた日時計算はJava側で行います。
+
+2.12 DEFAULTとUUID
+
+DEFAULT CURRENT_TIMESTAMPやDEFAULT 'ACTIVE'は、
+INSERT時に値を省略した場合の初期値です。
+UPDATE時にupdated_atを自動変更する設定ではありません。
+各テーブルのidにはUUID型を使いますが、SQL上の自動生成設定はありません。
+登録時にJava側でIDを指定します。
+
+
+3. auth_mail_jobsの暗号化データ消去条件
+--------------------------------------
+
+3.1 V2から変更する理由
+
+V2ではencrypted_payloadがNOT NULLで、
+さらに空の暗号化データもCHECK制約で禁止していました。
+そのままではメール送信後や取消後に秘密のリンク情報をNULLへ消去できません。
+
+V3では次の順番で変更します。
+
+1. V2のchk_auth_mail_jobs_payloadを削除
+2. encrypted_payload列のNOT NULLを解除
+3. 既存のSENT、CANCELLED行のencrypted_payloadをNULLへ更新
+4. 新しいchk_auth_mail_jobs_payload_lifecycleを追加
+
+既存行を変更するときはupdated_atを現在時刻にし、versionを1増やします。
+
+3.2 状態ごとの新しい条件
+
+PENDING、SENDING、FAILED、UNKNOWN
+  encrypted_payloadが必須で、長さが0より大きいことを要求します。
+
+SENT、CANCELLED
+  encrypted_payloadがNULLであることを要求します。
+
+送信処理側は、SENTまたはCANCELLEDへの状態変更と暗号化データの消去を
+同じUPDATEで行う必要があります。状態だけを変えるとCHECK制約で拒否されます。
+
+3.3 V3のUPDATEと今後の処理の違い
+
+V3のUPDATEは移行時点に存在する行だけを対象とします。
+V3適用後に送信が完了した行については、Java側の処理で暗号化データを消去します。
+UNKNOWNやFAILEDの保存期間と削除方針は、このSQLだけでは決まりません。
+
+
+4. customersテーブルとapp_usersの外部キー
+------------------------------------------
+
+4.1 目的
+
+customersは、保守会社に属する顧客企業を保存します。
+各行のtenant_idはtenants.idを参照します。
+
+主な列：
+
+id            顧客企業のUUID。主キー
+tenant_id     所属する保守会社のUUID
+name          顧客企業名。最大100文字
+contact_email 連絡先メールアドレス。最大254文字
+contact_phone 連絡先電話番号。任意、最大30文字
+status        ACTIVEまたはSTOPPED。初期値はACTIVE
+created_at    作成日時
+updated_at    更新日時
+version       同時更新の検出に使う番号
+
+4.2 登録条件
+
+nameは前後の空白を除いた結果が空文字であってはいけません。
+contact_emailは必須で、小文字化・前後空白除去済みの値だけを許可します。
+contact_phoneはNULLを許可しますが、値を入れる場合は空白だけにできません。
+statusはACTIVEとSTOPPEDのみ、versionは0以上です。
+
+メールアドレスの構文や電話番号の書式まで検証する制約はありません。
+
+4.3 複合一意制約と検索索引
+
+UNIQUE (tenant_id, id)は、後続の複合外部キーで使います。
+idx_customers_tenant_statusはテナントと状態による検索、
+idx_customers_tenant_nameはテナントと名前による検索を助けます。
+
+4.4 app_users.customer_idとの接続
+
+V2ではcustomersがまだ存在しなかったため、app_users.customer_idに
+外部キーを付けていませんでした。V3で次の関係を追加します。
+
+FOREIGN KEY (tenant_id, customer_id)
+REFERENCES customers (tenant_id, id)
+
+V2のchk_app_users_assignmentと合わせると、CUSTOMER役の利用者は
+同じテナント内の実在する顧客企業へ所属する必要があります。
+
+
+5. servicesテーブル
+-------------------
+
+servicesは、契約の対象になるサービスを保存します。
+各行はtenant_idで保守会社に所属します。
+
+主な列：
+
+id         サービスのUUID。主キー
+tenant_id  所属する保守会社のUUID
+name       サービス名。最大100文字
+status     ACTIVEまたはSTOPPED。初期値はACTIVE
+created_at 作成日時
+updated_at 更新日時
+version    同時更新の検出に使う番号
+
+nameは空白だけにできず、versionは0以上です。
+UNIQUE (tenant_id, id)はcontractsからの複合外部キーに使います。
+テナントと状態、テナントと名前の索引を作ります。
+
+name自体にUNIQUE制約はないため、同じテナント内で同名のサービスを登録できます。
+必要なら重複名の扱いをJava側で決めます。
+
+
+6. calendar_versionsテーブル
+-----------------------------
+
+6.1 目的
+
+営業時間と休業日を「版」としてまとめます。
+契約条件の版は、特定のcalendar_versions行を参照します。
+
+主な列：
+
+id         カレンダー版のUUID。主キー
+tenant_id  所属する保守会社のUUID
+name       カレンダー名
+revision   同じ名前の中での版番号。1以上
+zone_id    時間帯名。初期値はAsia/Tokyo
+created_by 作成した利用者のUUID
+created_at 作成日時
+
+created_byには、同じテナントに属するapp_usersの行を指定します。
+ただし、作成者のroleやstatusまでは外部キーで判定しません。
+
+6.2 一意性と入力条件
+
+UNIQUE (tenant_id, name, revision)により、
+同じ保守会社・同じ名前・同じ版番号の重複を禁止します。
+UNIQUE (tenant_id, id)は後続テーブルからの複合参照に使います。
+
+nameとzone_idは空白だけにできず、revisionは1以上です。
+zone_idが実在するタイムゾーン名かどうかは、このCHECK制約では検証しません。
+
+
+7. business_hoursテーブル
+-------------------------
+
+7.1 目的と列
+
+一つのカレンダー版に、曜日ごとの営業時間帯を登録します。
+
+calendar_version_id  対象のカレンダー版
+weekday              曜日。1=月曜日、7=日曜日
+opens_at             開始時刻
+closes_at            終了時刻
+
+複合外部キーにより、指定したカレンダー版が同じテナント内にあることを保証します。
+
+7.2 時間帯の条件
+
+weekdayは1から7までです。
+CHECK (opens_at < closes_at)により、同じ日の終了時刻が開始時刻より後であることを要求します。
+日付をまたぐ営業時間帯は、この1行では表現できません。
+
+7.3 同じ曜日の重複禁止
+
+EXCLUDE制約は、同じテナント・カレンダー版・曜日について
+営業時間帯が重なることを禁止します。
+
+時刻を固定の日付2000-01-01に載せてtsrangeを作り、重なりを判定します。
+範囲指定'[)'は開始時刻を含み、終了時刻を含みません。
+
+例：
+
+09:00～12:00 と 12:00～18:00  重複せず登録可能
+09:00～12:00 と 11:00～15:00  重複するため登録不可
+
+idx_business_hours_calendar_weekdayは、
+カレンダー版と曜日から営業時間を探す検索を助けます。
+
+
+8. holidaysテーブル
+-------------------
+
+holidaysはカレンダー版ごとの休業日を保存します。
+
+calendar_version_id  対象のカレンダー版ID
+holiday_on           休業日
+name                 休業日の名称。任意
+
+UNIQUE (tenant_id, calendar_version_id, holiday_on)により、
+同じ版に同じ休業日を二重登録できません。
+nameはNULLを許可しますが、値を入れる場合は空白だけにできません。
+
+現行V3では、tenant_idからtenantsへの外部キーはありますが、
+calendar_version_idからcalendar_versionsへの外部キーはありません。
+したがって、この列だけでは実在する版かどうか、同じテナントの版かどうかを
+DBが保証できません。Java側での確認、または後続マイグレーションでの
+複合外部キー追加が必要です。V3適用済みの環境ではV3を直接変更しません。
+
+
+9. contractsテーブル
+--------------------
+
+9.1 目的と関連
+
+顧客企業が対象サービスを利用する契約を保存します。
+contractsは、同じテナントのcustomersとservicesを複合外部キーで参照します。
+
+主な列：
+
+id                 契約のUUID。主キー
+tenant_id          所属する保守会社
+customer_id        契約する顧客企業
+service_id         対象サービス
+starts_on          契約開始日
+ends_on            契約終了日。NULLなら終了日未設定
+status             ACTIVEまたはSTOPPED。初期値はACTIVE
+current_version_id 現在利用するcontract_versionsのID
+created_at         作成日時
+updated_at         更新日時
+version            同時更新の検出に使う番号
+
+ends_onがある場合はstarts_on以降でなければなりません。
+versionは0以上です。
+
+9.2 ACTIVE契約の期間重複禁止
+
+同じテナント・顧客・サービスのACTIVE契約は、期間を重複させられません。
+daterange(starts_on, ends_on, '[]')は開始日と終了日を含む指定です。
+ends_onがNULLなら、終了日は無期限として扱われます。
+
+例：
+
+4月1日～4月30日 と 5月1日～5月31日  重複しない
+4月1日～4月30日 と 4月30日～5月31日 重複する
+
+EXCLUDE制約はstatus = 'ACTIVE'の行だけに適用されます。
+STOPPED契約はこの期間重複制約の対象外です。
+既存の顧客やサービスをSTOPPEDにしたとき、契約の状態を自動変更する処理はありません。
+
+9.3 索引
+
+idx_contracts_tenant_customer_statusは、顧客と状態による検索に使います。
+idx_contracts_tenant_service_statusは、サービスと状態による検索に使います。
+
+
+10. contract_versionsテーブルと現在版
+--------------------------------------
+
+10.1 契約条件を版として保存する
+
+contract_versionsは、契約条件の履歴となる版を保存します。
+主な列は次のとおりです。
+
+contract_id         対象契約
+revision            その契約内の版番号。1以上
+starts_on           その版に記録する契約開始日のスナップショット
+ends_on             契約終了日のスナップショット。NULL可
+target_minutes      初回返信までの目標時間。正の整数
+calendar_version_id 使用するカレンダー版
+created_by          作成した利用者
+created_at          作成日時
+
+契約、カレンダー版、作成者は同じテナント内の行を複合外部キーで参照します。
+ただし、作成者のroleやstatusまではDBで検査しません。
+
+10.2 一意性と値の条件
+
+UNIQUE (tenant_id, contract_id, revision)により、
+同じ契約に同じ版番号を二重登録できません。
+UNIQUE (tenant_id, contract_id, id)は現在版の参照に使います。
+
+ends_onがある場合はstarts_on以降です。
+target_minutesは0より大きくなければなりません。
+連番や契約本体の期間との一致は、このSQLでは自動保証されません。
+
+10.3 contractsとの相互参照
+
+contract_versions.contract_idはcontractsを参照します。
+一方、contracts.current_version_idはcontract_versionsを参照します。
+
+現在版の外部キーにはtenant_idとcontract_idも含まれるため、
+別のテナントや別の契約に属する版を現在版として指定できません。
+
+両方の外部キーはDEFERRABLE INITIALLY DEFERREDです。
+新しい契約と最初の契約版を同一トランザクション内に登録し、
+コミット時点で相互参照が成立している必要があります。
+
+後から現在版を切り替える場合は、まず新しいcontract_versions行を追加し、
+contracts.current_version_idをそのIDへ更新します。
+版の内容を更新して履歴を書き換える方法は、V3のトリガーで禁止されています。
+
+
+11. 版管理テーブルの変更・削除禁止
+----------------------------------
+
+keepia_reject_immutable_version_change()は、
+呼び出されたときに例外を発生させるトリガー関数です。
+V3では次の4テーブルに設定します。
+
+・calendar_versions
+・business_hours
+・holidays
+・contract_versions
+
+各テーブルのUPDATEとDELETEは行単位トリガーで拒否します。
+TRUNCATEは文単位トリガーで拒否します。
+新しい版や行のINSERTは禁止していません。
+
+エラーメッセージには対象テーブル名が入り、SQLSTATEは55000です。
+contracts、customers、servicesにはこの変更禁止トリガーはありません。
+
+この制約は、版データを上書きせず履歴として残すためのものです。
+版に含まれる行を間違えた場合も直接修正できないため、
+新しい版を作成する運用が必要です。
+
+
+12. SQLとJava側の役割分担
+------------------------
+
+DBが主に保証すること
+
+・親テーブルに実在する行への参照と、複合外部キーで指定したテナントの一致
+・必須列、許容状態、正の版番号、正の目標時間、日付・時刻の前後関係
+・同一版・同一曜日の営業時間帯の重複禁止
+・同一テナント・顧客・サービスのACTIVE契約期間の重複禁止
+・契約の現在版が同じ契約に属すること
+・版管理テーブルの更新、削除、全件切り詰めの禁止
+
+Java側で実装・確認すること
+
+・UUIDの生成と、登録するテナントIDの権限確認
+・顧客、サービス、作成者が現在利用可能な状態かの判定
+・メールアドレスや電話番号の業務上必要な形式確認
+・updated_atの更新とversionを使った同時更新の制御
+・SENT、CANCELLEDへの変更時のencrypted_payload消去
+・カレンダー版のrevisionと契約版のrevisionの採番
+・営業時間、休業日、タイムゾーンを使う実際の応答期限計算
+・契約本体の期間と契約版のスナップショットの整合確認
+・STOPPED状態の顧客・サービス・契約を利用対象から外す判定
+・holidays.calendar_version_idが実在し同じテナントに属することの確認
+
+
+13. V3適用後の確認事項
+----------------------
+
+Flywayの実行ログに
+「Successfully applied 1 migration ... now at version v3」
+と表示されれば、V3のマイグレーションは適用されています。
+アプリの「Started KeepiaApplication」は起動完了を示します。
+それだけで画面操作や期限計算の動作まで検証されたわけではありません。
+
+V3は適用済みのため、運用中に定義を変更する場合は、
+V3ファイルを書き換えるのではなくV4以降の新しいマイグレーションを追加します。
+特にholidaysのカレンダー版外部キーを追加する場合は、
+既存行に不正な参照がないことを確認してから追加します。
+
+SQL内の一部の制約名・トリガー名には綴りの揺れがあります。
+名称自体は動作を妨げませんが、後続マイグレーションで制約を変更するときは
+実際に登録された名前を確認してください。
+
+以上
