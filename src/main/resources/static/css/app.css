@@ -1,0 +1,97 @@
+@charset "UTF-8";
+/* ========================================
+   共通設定
+======================================== */
+:root {
+    color-scheme: light;
+    font-family: "Yu Gothic UI", "Meiryo", sans-serif;
+    line-height: 1.5;
+}
+
+body {
+    margin: 0;
+    color: #1f2937;
+    background: #f3f4f6;
+}
+
+/* ========================================
+   レイアウト
+======================================== */
+
+.auth-container,
+.page-container {
+    width: min(100% - 2rem, 32rem);
+    margin: 4rem auto;
+}
+
+.auth-panel,
+.page-container {
+    padding: 2rem;
+    background: #ffffff;
+    border: 1px solid #d1d5db;
+    border-radius: 0.5rem;
+}
+
+/* ========================================
+   フォーム
+======================================== */
+
+.field {
+    margin-bottom: 1rem;
+}
+
+label {
+    display: block;
+    margin-bottom: 0.25rem;
+    font-weight: 600;
+}
+
+input {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 0.65rem;
+    border: 1px solid #9ca3af;
+    border-radius: 0.25rem;
+}
+
+/* ========================================
+   ボタン
+======================================== */
+
+button {
+    padding: 0.65rem 1rem;
+    color: #ffffff;
+    background: #1d4ed8;
+    border: 0;
+    border-radius: 0.25rem;
+    cursor: pointer;
+}
+
+button:hover,
+button:focus-visible {
+    background: #1e40af;
+}
+
+/* ========================================
+   メッセージ表示
+======================================== */
+
+.message {
+    padding: 0.75rem;
+    border-radius: 0.25rem;
+}
+
+.message.error {
+    color: #991b1b;
+    background: #fee2e2;
+}
+
+.message.success {
+    color: #166534;
+    background: #dcfce7;
+}
+
+.message.info {
+    color: #1e3a8a;
+    background: #dbeafe;
+}
