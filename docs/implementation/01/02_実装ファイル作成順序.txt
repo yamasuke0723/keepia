@@ -1,0 +1,547 @@
+Keepia 認証・認可基盤　実装ファイル作成順序
+==============================================
+
+1. この文書の目的
+------------------
+
+この文書は、分割済みのコード・設定ファイル44個を、依存関係で迷わない順番に
+自分の手で入力するための実装順序表である。
+
+基本仕様書は設計内容を機能別に説明しているため、説明の登場順と、実際にJava
+ファイルを作る順番は必ずしも一致しない。
+
+たとえばTenant.javaはTenantStatusを使用するため、実装時は次の順番になる。
+
+1) TenantStatus.javaを作る。
+2) Tenant.javaを作る。
+
+同様に、SecurityConfig.javaは多数のクラスを組み立てる設定クラスなので、
+関連クラスをすべて作った後、production Javaの最後に作る。
+
+
+2. 実装時の基本ルール
+----------------------
+
+・この資料フォルダからKeepia本体へファイルを一括コピーしない。
+・各ファイルの内容を確認しながら、自分の手で1ファイルずつ入力する。
+・package文、import文、アノテーション、修飾子、Javadocも省略しない。
+・Entityのフィールドはprivateのまま入力する。
+・V1～V5のSQLファイルは変更しない。
+・コンパイルエラーが出た場合、後続ファイルを先に増やさず、その工程内で解消する。
+・各工程の確認が成功してから次の工程へ進む。
+
+
+3. 作業開始前
+--------------
+
+この工程ではまだファイルを作らない。
+
+1) mainブランチにいることを確認する。
+
+   git branch --show-current
+
+2) 未コミット変更を確認する。
+
+   git status
+
+3) 実装ブランチを作る。
+
+   git switch -c feature/authentication-foundation
+
+4) 現在のテスト結果を確認する。
+
+   .\mvnw.cmd test
+
+既存テストが失敗した場合は、今回の実装前からの失敗として記録する。
+
+
+4. 工程1　列挙型を作る
+----------------------
+
+Entityより先に、Entityのフィールド型として使用するenumを作る。
+
+作成順1
+src/main/java/jp/keepia/domain/TenantStatus.java
+
+役割：
+保守会社の状態をACTIVE、STOPPEDとして定義する。
+Tenant.javaのstatusフィールドがこの型を使用する。
+
+作成順2
+src/main/java/jp/keepia/domain/CustomerStatus.java
+
+役割：
+顧客の状態をACTIVE、STOPPEDとして定義する。
+Customer.javaのstatusフィールドがこの型を使用する。
+
+作成順3
+src/main/java/jp/keepia/domain/UserRole.java
+
+役割：
+OPERATOR、ADMIN、STAFF、CUSTOMERを定義する。
+AppUser、AccountPrincipal、AccessScope、AccessPolicyが使用する。
+
+作成順4
+src/main/java/jp/keepia/domain/UserStatus.java
+
+役割：
+利用者の状態を定義する。
+AppUser.javaのstatusフィールドがこの型を使用する。
+
+工程1の確認：
+
+   .\mvnw.cmd -DskipTests compile
+
+この時点で後続クラスがまだ存在しないことによるエラーは発生しない。
+
+
+5. 工程2　Entityを作る
+----------------------
+
+enumを作成した後、DBのテーブルへ対応するEntityを作る。
+
+作成順5
+src/main/java/jp/keepia/domain/Tenant.java
+
+先に必要なファイル：
+TenantStatus.java
+
+対応テーブル：
+tenants
+
+作成順6
+src/main/java/jp/keepia/domain/Customer.java
+
+先に必要なファイル：
+CustomerStatus.java
+
+対応テーブル：
+customers
+
+作成順7
+src/main/java/jp/keepia/domain/AppUser.java
+
+先に必要なファイル：
+UserRole.java
+UserStatus.java
+
+対応テーブル：
+app_users
+
+作成順8
+src/main/java/jp/keepia/domain/LoginRateLimit.java
+
+対応テーブル：
+login_rate_limits
+
+工程2の確認：
+
+   .\mvnw.cmd -DskipTests compile
+
+確認すること：
+
+・importエラーがない。
+・EnumType.STRINGを使用している。
+・DBの列名と@Columnのnameが一致している。
+・Entityのフィールドがprivateになっている。
+・JPA用コンストラクタがprotectedになっている。
+
+
+6. 工程3　Repositoryを作る
+--------------------------
+
+Entityがすべてコンパイルできた後、DB検索用Repositoryを作る。
+
+作成順9
+src/main/java/jp/keepia/repository/TenantRepository.java
+
+依存先：
+Tenant.java
+
+作成順10
+src/main/java/jp/keepia/repository/CustomerRepository.java
+
+依存先：
+Customer.java
+
+作成順11
+src/main/java/jp/keepia/repository/AppUserRepository.java
+
+依存先：
+AppUser.java
+
+作成順12
+src/main/java/jp/keepia/repository/LoginRateLimitRepository.java
+
+依存先：
+LoginRateLimit.java
+
+注意：
+LoginRateLimitRepositoryにはPostgreSQLのON CONFLICTを使用する処理がある。
+login_rate_limits.key_hashに一意制約または一意インデックスが存在することを、
+V1～V5の定義で確認する。既存SQLはこの段階では変更しない。
+
+工程3の確認：
+
+   .\mvnw.cmd -DskipTests compile
+
+
+7. 工程4　認証設定値と小さな共通クラスを作る
+----------------------------------------------
+
+Serviceを作る前に、Serviceから使用される設定値と依存の少ないクラスを作る。
+
+作成順13
+src/main/java/jp/keepia/config/SecurityProperties.java
+
+役割：
+セッション絶対期限、ログイン失敗制限、HMAC秘密値を保持する。
+
+作成順14
+src/main/java/jp/keepia/security/EmailNormalizer.java
+
+役割：
+ログイン用メールアドレスの前後空白除去と小文字化を行う。
+
+作成順15
+src/main/java/jp/keepia/security/AccountPrincipal.java
+
+先に必要なファイル：
+AppUser.java
+UserRole.java
+
+役割：
+Spring Securityが保持する認証済み利用者情報を表す。
+認証後はeraseCredentials()でパスワードハッシュを消去する。
+
+作成順16
+src/main/java/jp/keepia/security/AccessScope.java
+
+先に必要なファイル：
+AccountPrincipal.java
+UserRole.java
+
+役割：
+認証済み利用者のtenantId、customerId、roleを業務処理へ渡す。
+
+作成順17
+src/main/java/jp/keepia/security/AccessPolicy.java
+
+先に必要なファイル：
+AccessScope.java
+UserRole.java
+
+役割：
+Service層でRole、Tenant、Customerのアクセス範囲を確認する。
+
+工程4の確認：
+
+   .\mvnw.cmd -DskipTests compile
+
+
+8. 工程5　利用者読込とログイン失敗制限を作る
+--------------------------------------------
+
+Repositoryと共通クラスを組み合わせるServiceを作る。
+
+作成順18
+src/main/java/jp/keepia/security/AccountUserDetailsService.java
+
+先に必要なファイル：
+AppUserRepository.java
+TenantRepository.java
+CustomerRepository.java
+EmailNormalizer.java
+AccountPrincipal.java
+
+作成順19
+src/main/java/jp/keepia/security/LoginAttemptKeyFactory.java
+
+先に必要なファイル：
+SecurityProperties.java
+EmailNormalizer.java
+
+役割：
+メールアドレスと接続元アドレスをHMAC-SHA-256でハッシュ化する。
+
+作成順20
+src/main/java/jp/keepia/security/LoginAttemptService.java
+
+先に必要なファイル：
+LoginRateLimitRepository.java
+LoginAttemptKeyFactory.java
+SecurityProperties.java
+
+役割：
+ログイン失敗回数、ブロック期限、成功時のリセットを管理する。
+
+工程5の確認：
+
+   .\mvnw.cmd -DskipTests compile
+
+
+9. 工程6　認証HandlerとFilterを作る
+-----------------------------------
+
+ログイン処理へ組み込むHandlerとFilterを作る。
+
+作成順21
+src/main/java/jp/keepia/security/LoginFailureHandler.java
+
+先に必要なファイル：
+LoginAttemptService.java
+
+作成順22
+src/main/java/jp/keepia/security/LoginSuccessHandler.java
+
+先に必要なファイル：
+LoginAttemptService.java
+AccountPrincipal.java
+
+作成順23
+src/main/java/jp/keepia/security/LoginRateLimitFilter.java
+
+先に必要なファイル：
+LoginAttemptService.java
+
+作成順24
+src/main/java/jp/keepia/security/CurrentAccessFilter.java
+
+先に必要なファイル：
+AppUserRepository.java
+TenantRepository.java
+CustomerRepository.java
+AccountPrincipal.java
+SecurityProperties.java
+
+工程6の確認：
+
+   .\mvnw.cmd -DskipTests compile
+
+
+10. 工程7　ControllerとSecurityConfigを作る
+------------------------------------------
+
+すべての認証部品が作成できた後、画面Controllerと組み立て設定を作る。
+
+作成順25
+src/main/java/jp/keepia/account/AccountController.java
+
+先に必要なファイル：
+AccountPrincipal.java
+
+作成順26
+src/main/java/jp/keepia/config/SecurityConfig.java
+
+作成を最後にする理由：
+SecurityConfigはAccountUserDetailsService、各Handler、各Filter、Repository、
+SecurityPropertiesをまとめてSpring Securityへ登録するためである。
+先にSecurityConfigを入力すると、未作成クラスによるコンパイルエラーが大量に出る。
+
+工程7の確認：
+
+   .\mvnw.cmd -DskipTests compile
+
+ここまで成功すれば、production Java 26ファイルの入力が完了している。
+
+
+11. 工程8　設定ファイルを作る
+----------------------------
+
+作成順27
+src/main/resources/application.properties
+
+注意：
+KEEPIA_DB_PASSWORDとKEEPIA_LOGIN_KEY_SECRETの実値をファイルへ書かない。
+環境変数の参照式をそのまま使用する。
+
+
+12. 工程9　画面とCSSを作る
+--------------------------
+
+作成順28
+src/main/resources/static/css/app.css
+
+作成順29
+src/main/resources/templates/login.html
+
+作成順30
+src/main/resources/templates/home.html
+
+作成順31
+src/main/resources/templates/error/403.html
+
+確認すること：
+
+・login.htmlとhome.htmlのPOSTフォームにCSRF項目がある。
+・パスワードを画面へ再表示しない。
+・403.htmlへ例外、SQL、内部クラス名を表示しない。
+
+工程9の確認：
+
+   .\mvnw.cmd -DskipTests compile
+
+環境変数が準備できている場合だけ、アプリケーションを起動して画面を確認する。
+
+
+13. 工程10　テスト設定とFixtureを作る
+--------------------------------------
+
+productionコードの入力が完了してからテストコードを作る。
+
+作成順32
+src/test/resources/application-test.properties
+
+注意：
+テストDBのパスワード実値をファイルへ書かない。
+
+作成順33
+src/test/java/jp/keepia/domain/DomainFixtures.java
+
+役割：
+AppUser、Tenant、Customerを任意の状態で作るテスト専用補助クラス。
+後続のテストクラスが使用するため、最初に作る。
+
+
+14. 工程11　依存の少ない単体テストを作る
+----------------------------------------
+
+作成順34
+src/test/java/jp/keepia/domain/UserRoleTest.java
+
+作成順35
+src/test/java/jp/keepia/domain/AppUserTest.java
+
+作成順36
+src/test/java/jp/keepia/domain/LoginRateLimitTest.java
+
+作成順37
+src/test/java/jp/keepia/security/AccountPrincipalTest.java
+
+作成順38
+src/test/java/jp/keepia/security/AccessScopeTest.java
+
+作成順39
+src/test/java/jp/keepia/security/LoginAttemptKeyFactoryTest.java
+
+工程11の確認：
+
+   .\mvnw.cmd -DskipTests test-compile
+
+テスト用Javaファイルのコンパイルだけを確認する。
+
+
+15. 工程12　ServiceとFilterの単体テストを作る
+-------------------------------------------
+
+作成順40
+src/test/java/jp/keepia/security/AccountUserDetailsServiceTest.java
+
+作成順41
+src/test/java/jp/keepia/security/CurrentAccessFilterTest.java
+
+工程12の確認：
+
+   .\mvnw.cmd -DskipTests test-compile
+
+
+16. 工程13　PostgreSQL結合テストを作る
+--------------------------------------
+
+作成順42
+src/test/java/jp/keepia/repository/RepositoryIntegrationTest.java
+
+作成順43
+src/test/java/jp/keepia/security/LoginAttemptServiceIntegrationTest.java
+
+作成順44
+src/test/java/jp/keepia/security/AuthenticationFlowTest.java
+
+AuthenticationFlowTestを最後にする理由：
+Entity、Repository、Service、Filter、Handler、SecurityConfig、Controller、HTML、
+テストDB設定のすべてを接続して確認する最終結合テストだからである。
+
+
+17. 最終テスト実行順序
+----------------------
+
+テスト用PostgreSQLと次の環境変数を準備する。
+
+・KEEPIA_TEST_DB_URL
+・KEEPIA_TEST_DB_USER
+・KEEPIA_TEST_DB_PASSWORD
+
+1) コンパイルを確認する。
+
+   .\mvnw.cmd clean test-compile
+
+2) 全テストを実行する。
+
+   .\mvnw.cmd test
+
+3) 成功後に差分を確認する。
+
+   git status
+   git diff --check
+
+4) V1～V5が変更されていないことを確認する。
+
+5) ブラウザで次を手動確認する。
+
+・ログイン画面を表示できる。
+・正しいメールアドレスとパスワードでログインできる。
+・誤った資格情報では共通エラーを表示する。
+・ログアウトできる。
+・停止利用者と停止所属先を拒否できる。
+・権限不足時に403画面を表示する。
+・ログイン失敗上限到達後に一時ブロックされる。
+
+
+18. 順序だけを確認する短縮一覧
+--------------------------------
+
+01 TenantStatus.java
+02 CustomerStatus.java
+03 UserRole.java
+04 UserStatus.java
+05 Tenant.java
+06 Customer.java
+07 AppUser.java
+08 LoginRateLimit.java
+09 TenantRepository.java
+10 CustomerRepository.java
+11 AppUserRepository.java
+12 LoginRateLimitRepository.java
+13 SecurityProperties.java
+14 EmailNormalizer.java
+15 AccountPrincipal.java
+16 AccessScope.java
+17 AccessPolicy.java
+18 AccountUserDetailsService.java
+19 LoginAttemptKeyFactory.java
+20 LoginAttemptService.java
+21 LoginFailureHandler.java
+22 LoginSuccessHandler.java
+23 LoginRateLimitFilter.java
+24 CurrentAccessFilter.java
+25 AccountController.java
+26 SecurityConfig.java
+27 application.properties
+28 app.css
+29 login.html
+30 home.html
+31 403.html
+32 application-test.properties
+33 DomainFixtures.java
+34 UserRoleTest.java
+35 AppUserTest.java
+36 LoginRateLimitTest.java
+37 AccountPrincipalTest.java
+38 AccessScopeTest.java
+39 LoginAttemptKeyFactoryTest.java
+40 AccountUserDetailsServiceTest.java
+41 CurrentAccessFilterTest.java
+42 RepositoryIntegrationTest.java
+43 LoginAttemptServiceIntegrationTest.java
+44 AuthenticationFlowTest.java
+
